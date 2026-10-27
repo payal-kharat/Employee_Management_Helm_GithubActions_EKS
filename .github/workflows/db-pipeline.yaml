@@ -75,7 +75,7 @@ jobs:
           TAG="DEV-$(git rev-parse --short HEAD)"
 
           test -f ./db/Dockerfile || {
-            echo "ERROR: ./db/Dockerfile not found"
+            echo "::error::./db/Dockerfile not found"
             exit 1
           }
 
@@ -154,6 +154,7 @@ jobs:
             docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
           docker pull "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG"
+
           docker tag \
             "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG" \
             "$ECR_REGISTRY/$TARGET_REPOSITORY:$IMAGE_TAG"
@@ -172,8 +173,6 @@ jobs:
       - promote
     if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success')
     runs-on: ubuntu-latest
-    # Uses the GitHub Environment selected in the workflow_dispatch input.
-    # Create dev, qa, uat, and prod under Repository Settings > Environments.
     environment:
       name: ${{ inputs.deploy_env }}
     steps:
@@ -218,9 +217,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION"
+
           kubectl get namespaces
 
       - name: Create Selected Namespace
@@ -229,7 +230,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          kubectl create namespace "$DEPLOY_ENV" --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create namespace "$DEPLOY_ENV" --dry-run=client -o yaml |
+            kubectl apply -f -
+
           kubectl get namespace "$DEPLOY_ENV"
 
       - name: Deploy Database with Helm
@@ -253,17 +257,20 @@ jobs:
           fi
 
           VALUES_FILE="${HELM_CHART_PATH}/values-${DEPLOY_ENV}.yaml"
+
           test -f "$VALUES_FILE" || {
             echo "::error::Helm values file not found: $VALUES_FILE"
             exit 1
           }
 
+          TARGET_REPOSITORY="${ECR_REPOSITORY_PREFIX}-${DEPLOY_ENV}-db"
+
           helm upgrade --install "$HELM_RELEASE" "$HELM_CHART_PATH" \
             --namespace "$DEPLOY_ENV" \
             --create-namespace \
             --values "$VALUES_FILE" \
-            --set-string "components.mysql.image.repository=${ECR_REGISTRY}/employee-mgm-${DEPLOY_ENV}-db" \
-            --set-string "components.mysql.image.tag=${IMAGE_TAG}" \
+            --set-string "components.mysql.image=${ECR_REGISTRY}/${TARGET_REPOSITORY}" \
+            --set-string "components.mysql.tag=${IMAGE_TAG}" \
             --wait \
             --timeout 10m
 
