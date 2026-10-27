@@ -30,7 +30,7 @@ env:
   ECR_REGISTRY: 552940445807.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPOSITORY_PREFIX: employee-mgm
   EKS_CLUSTER_NAME: employee-mgm-dev-cluster
-  HELM_CHART_PATH: ./employee-management-system
+  HELM_CHART_PATH: ./Helm
   HELM_RELEASE: employee-management-db
 
 jobs:
