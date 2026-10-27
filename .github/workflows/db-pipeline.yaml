@@ -223,6 +223,10 @@ jobs:
       - promote
     if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success')
     runs-on: ubuntu-latest
+    # Uses the GitHub Environment selected in the workflow_dispatch input.
+    # Create dev, qa, uat, and prod under Repository Settings > Environments.
+    environment:
+      name: ${{ inputs.deploy_env }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
