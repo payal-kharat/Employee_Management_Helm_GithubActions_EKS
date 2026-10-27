@@ -44,19 +44,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check AWS Role Variable
+      - name: Check AWS Role Secret
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN is empty or unavailable"
-            echo "Check Settings > Secrets and variables > Actions > Variables."
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-          echo "AWS role variable is set."
-          echo "Role ARN: $AWS_ROLE_ARN"
+          echo "AWS role secret is available."
+
+      - name: Debug OIDC Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOKEN_JSON=$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
+
+          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
+
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+            1)
+              echo "::error::Invalid OIDC token payload"
+              exit 1
+              ;;
+          esac
+
+          echo "OIDC claims (token omitted):"
+          printf '%s' "$PAYLOAD" | base64 --decode |
+            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -105,18 +129,42 @@ jobs:
     if: inputs.deploy_env != 'dev'
     runs-on: ubuntu-latest
     steps:
-      - name: Check AWS Role Variable
+      - name: Check AWS Role Secret
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN is empty or unavailable"
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-          echo "AWS role variable is set."
-          echo "Role ARN: $AWS_ROLE_ARN"
+          echo "AWS role secret is available."
+
+      - name: Debug OIDC Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOKEN_JSON=$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
+          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
+
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+            1)
+              echo "::error::Invalid OIDC token payload"
+              exit 1
+              ;;
+          esac
+
+          echo "OIDC claims (token omitted):"
+          printf '%s' "$PAYLOAD" | base64 --decode |
+            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -131,7 +179,6 @@ jobs:
         shell: bash
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
-          DEPLOY_ENV: ${{ inputs.deploy_env }}
         run: |
           set -euo pipefail
           if [[ ! "$IMAGE_TAG" =~ ^DEV-[A-Za-z0-9._-]+$ ]]; then
@@ -180,18 +227,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check AWS Role Variable
+      - name: Check AWS Role Secret
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN is empty or unavailable"
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-          echo "AWS role variable is set."
-          echo "Role ARN: $AWS_ROLE_ARN"
+          echo "AWS role secret is available."
+
+      - name: Debug OIDC Claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOKEN_JSON=$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
+          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
+
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+            1)
+              echo "::error::Invalid OIDC token payload"
+              exit 1
+              ;;
+          esac
+
+          echo "OIDC claims (token omitted):"
+          printf '%s' "$PAYLOAD" | base64 --decode |
+            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
