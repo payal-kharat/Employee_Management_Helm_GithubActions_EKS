@@ -56,32 +56,6 @@ jobs:
           fi
           echo "AWS role secret is available."
 
-      - name: Debug OIDC Claims
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TOKEN_JSON=$(curl -fsS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-
-          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
-
-          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
-
-          case $((${#PAYLOAD} % 4)) in
-            2) PAYLOAD="${PAYLOAD}==" ;;
-            3) PAYLOAD="${PAYLOAD}=" ;;
-            1)
-              echo "::error::Invalid OIDC token payload"
-              exit 1
-              ;;
-          esac
-
-          echo "OIDC claims (token omitted):"
-          printf '%s' "$PAYLOAD" | base64 --decode |
-            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -140,31 +114,6 @@ jobs:
             exit 1
           fi
           echo "AWS role secret is available."
-
-      - name: Debug OIDC Claims
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TOKEN_JSON=$(curl -fsS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-
-          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
-          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
-
-          case $((${#PAYLOAD} % 4)) in
-            2) PAYLOAD="${PAYLOAD}==" ;;
-            3) PAYLOAD="${PAYLOAD}=" ;;
-            1)
-              echo "::error::Invalid OIDC token payload"
-              exit 1
-              ;;
-          esac
-
-          echo "OIDC claims (token omitted):"
-          printf '%s' "$PAYLOAD" | base64 --decode |
-            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -243,31 +192,6 @@ jobs:
           fi
           echo "AWS role secret is available."
 
-      - name: Debug OIDC Claims
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TOKEN_JSON=$(curl -fsS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-
-          ID_TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -er '.value')
-          PAYLOAD=$(printf '%s' "$ID_TOKEN" | cut -d '.' -f2 | tr '_-' '/+')
-
-          case $((${#PAYLOAD} % 4)) in
-            2) PAYLOAD="${PAYLOAD}==" ;;
-            3) PAYLOAD="${PAYLOAD}=" ;;
-            1)
-              echo "::error::Invalid OIDC token payload"
-              exit 1
-              ;;
-          esac
-
-          echo "OIDC claims (token omitted):"
-          printf '%s' "$PAYLOAD" | base64 --decode |
-            jq '{iss, aud, sub, repository, repository_id, repository_owner, ref, environment}'
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -298,6 +222,15 @@ jobs:
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION"
           kubectl get namespaces
+
+      - name: Create Selected Namespace
+        env:
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$DEPLOY_ENV" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl get namespace "$DEPLOY_ENV"
 
       - name: Deploy Database with Helm
         shell: bash
