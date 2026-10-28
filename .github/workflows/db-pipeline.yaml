@@ -50,12 +50,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "$AWS_ROLE_ARN" ]; then
             echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-
           echo "AWS role secret is available."
 
       - name: Configure AWS Credentials
@@ -102,9 +100,21 @@ jobs:
 
           echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  production-approval:
+    name: Manual Production Approval
+    if: inputs.deploy_env == 'prod'
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+    steps:
+      - name: Production Approval Granted
+        run: echo "Production approval granted. The pipeline can continue."
+
   promote:
     name: Promote DEV Database Image
-    if: inputs.deploy_env != 'dev'
+    needs:
+      - production-approval
+    if: always() && inputs.deploy_env != 'dev' && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Check AWS Role Secret
@@ -113,12 +123,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "$AWS_ROLE_ARN" ]; then
             echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-
           echo "AWS role secret is available."
 
       - name: Configure AWS Credentials
@@ -136,7 +144,6 @@ jobs:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           set -euo pipefail
-
           if [[ ! "$IMAGE_TAG" =~ ^DEV-[A-Za-z0-9._-]+$ ]]; then
             echo "::error::Provide a valid original DEV image tag, such as DEV-b625074."
             exit 1
@@ -177,11 +184,10 @@ jobs:
     name: Deploy Database to Kubernetes
     needs:
       - build-dev
+      - production-approval
       - promote
-    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success')
+    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success') && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.deploy_env }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -192,12 +198,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "$AWS_ROLE_ARN" ]; then
             echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
             exit 1
           fi
-
           echo "AWS role secret is available."
 
       - name: Configure AWS Credentials
@@ -341,4 +345,3 @@ jobs:
           fi
 
           kubectl get pods,services,pvc -n "${NAMESPACE}"
-
