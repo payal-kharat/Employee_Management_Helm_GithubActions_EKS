@@ -1,1 +1,302 @@
 
+
+name: Employee Management Frontend Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: Deployment Environment
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - qa
+          - uat
+          - prod
+      image_tag:
+        description: Original DEV image tag for QA, UAT or PROD (example DEV-b625074)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: '020048087135'
+  ECR_REGISTRY: 020048087135.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY_PREFIX: employee-mgm
+  EKS_CLUSTER_NAME: employee-mgm-dev-cluster
+  HELM_CHART_PATH: ./Helm
+  HELM_RELEASE: employee-management-frontend
+
+jobs:
+  build-dev:
+    name: Build and Push DEV Frontend
+    if: inputs.deploy_env == 'dev'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check AWS Role Secret
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
+            exit 1
+          fi
+          echo "AWS role secret is available."
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Build and Push Image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPOSITORY="${ECR_REPOSITORY_PREFIX}-dev-frontend"
+          TAG="DEV-$(git rev-parse --short HEAD)"
+
+          test -f ./frontend/Dockerfile || {
+            echo "::error::./frontend/Dockerfile not found"
+            exit 1
+          }
+
+          aws ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --region "$AWS_REGION"
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+          docker build \
+            -f ./frontend/Dockerfile \
+            -t "$ECR_REGISTRY/$REPOSITORY:$TAG" \
+            ./frontend
+
+          docker push "$ECR_REGISTRY/$REPOSITORY:$TAG"
+
+          aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$TAG" \
+            --region "$AWS_REGION"
+
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  promote:
+    name: Promote DEV Frontend Image
+    if: inputs.deploy_env != 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check AWS Role Secret
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
+            exit 1
+          fi
+          echo "AWS role secret is available."
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Validate Original DEV Image Tag
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_TAG" =~ ^DEV-[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Provide a valid original DEV image tag, such as DEV-b625074."
+            exit 1
+          fi
+
+      - name: Promote Image Between ECR Repositories
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        run: |
+          set -euo pipefail
+          SOURCE_REPOSITORY="${ECR_REPOSITORY_PREFIX}-dev-frontend"
+          TARGET_REPOSITORY="${ECR_REPOSITORY_PREFIX}-${DEPLOY_ENV}-frontend"
+
+          aws ecr describe-repositories \
+            --repository-names "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY" \
+            --region "$AWS_REGION"
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+          docker pull "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG"
+
+          docker tag \
+            "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG" \
+            "$ECR_REGISTRY/$TARGET_REPOSITORY:$IMAGE_TAG"
+
+          docker push "$ECR_REGISTRY/$TARGET_REPOSITORY:$IMAGE_TAG"
+
+          aws ecr describe-images \
+            --repository-name "$TARGET_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION"
+
+  deploy:
+    name: Deploy Frontend to Kubernetes
+    needs:
+      - build-dev
+      - promote
+    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success')
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.deploy_env }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check AWS Role Secret
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
+            exit 1
+          fi
+          echo "AWS role secret is available."
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Install kubectl and Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kubectl \
+            "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo install kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
+            bash
+
+      - name: Configure EKS Access
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+          kubectl get namespaces
+
+      - name: Create Selected Namespace
+        env:
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$DEPLOY_ENV" \
+            --dry-run=client \
+            -o yaml |
+            kubectl apply -f -
+          kubectl get namespace "$DEPLOY_ENV"
+
+      - name: Deploy Frontend with Helm
+        shell: bash
+        env:
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+          DEV_IMAGE_TAG: ${{ needs.build-dev.outputs.image_tag }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DEPLOY_ENV" = "dev" ]; then
+            TAG="$DEV_IMAGE_TAG"
+          else
+            TAG="$INPUT_IMAGE_TAG"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Frontend image tag is empty."
+            exit 1
+          fi
+
+          NAMESPACE="$DEPLOY_ENV"
+          CHART="$HELM_CHART_PATH"
+          REPOSITORY="${ECR_REPOSITORY_PREFIX}-${DEPLOY_ENV}-frontend"
+          REGISTRY="$ECR_REGISTRY"
+          VALUES_FILE="${CHART}/values-${DEPLOY_ENV}.yaml"
+
+          test -f "$VALUES_FILE" || {
+            echo "::error::Helm values file not found: $VALUES_FILE"
+            exit 1
+          }
+
+          if ! kubectl get service frontend-service -n "$NAMESPACE" >/dev/null 2>&1; then
+            echo "::notice::Frontend service will be created by Helm if configured in the chart."
+          fi
+
+          if ! helm upgrade --install "${HELM_RELEASE}" "${CHART}" \
+            --namespace "${NAMESPACE}" \
+            --create-namespace \
+            -f "${VALUES_FILE}" \
+            --set-string components.frontend.image="${REGISTRY}/${REPOSITORY}" \
+            --set-string components.frontend.tag="${TAG}" \
+            --set components.frontend.enabled=true \
+            --set components.frontend.service.enabled=true \
+            --set components.backend.enabled=false \
+            --set components.mysql.enabled=false \
+            --set ingress.enabled=true \
+            --set configMap.enabled=false \
+            --set secret.enabled=false \
+            --set storageClass.enabled=false \
+            --wait \
+            --timeout 10m; then
+            echo "::error::Helm frontend deployment failed in namespace ${NAMESPACE}."
+            helm status "${HELM_RELEASE}" -n "${NAMESPACE}" || true
+            kubectl get pods,services,ingress -n "${NAMESPACE}" || true
+            exit 1
+          fi
+
+          if ! kubectl rollout status deployment/frontend \
+            -n "${NAMESPACE}" \
+            --timeout=5m; then
+            echo "::error::Frontend Deployment rollout failed in namespace ${NAMESPACE}."
+            kubectl logs deployment/frontend -n "${NAMESPACE}" --all-containers=true --tail=100 || true
+            kubectl describe deployment/frontend -n "${NAMESPACE}" || true
+            exit 1
+          fi
+
+          kubectl get pods,services,ingress -n "${NAMESPACE}"
