@@ -1,5 +1,4 @@
 
-
 name: Employee Management Frontend Pipeline
 
 on:
@@ -100,9 +99,20 @@ jobs:
 
           echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  production-approval:
+    name: Manual Approval for Production
+    if: inputs.deploy_env == 'prod'
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+    steps:
+      - name: Production Approval Granted
+        run: echo "Production approval granted. Frontend image promotion and deployment can proceed."
+
   promote:
     name: Promote DEV Frontend Image
-    if: inputs.deploy_env != 'dev'
+    needs: production-approval
+    if: always() && inputs.deploy_env != 'dev' && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Check AWS Role Secret
@@ -171,11 +181,10 @@ jobs:
     name: Deploy Frontend to Kubernetes
     needs:
       - build-dev
+      - production-approval
       - promote
-    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success')
+    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success') && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.deploy_env }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
