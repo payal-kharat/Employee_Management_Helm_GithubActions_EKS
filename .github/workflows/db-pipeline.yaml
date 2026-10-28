@@ -26,8 +26,8 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  AWS_ACCOUNT_ID: '552940445807'
-  ECR_REGISTRY: 552940445807.dkr.ecr.us-east-1.amazonaws.com
+  AWS_ACCOUNT_ID: '020048087135'
+  ECR_REGISTRY: 020048087135.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPOSITORY_PREFIX: employee-mgm
   EKS_CLUSTER_NAME: employee-mgm-dev-cluster
   HELM_CHART_PATH: ./Helm
