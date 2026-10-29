@@ -72,7 +72,7 @@ jobs:
           echo "Built and pushed ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
   promote-image:
-    name: Promote Existing DB Image
+    name: Promote Existing DEV Image
     if: inputs.deploy_env != 'dev'
     runs-on: ubuntu-latest
     outputs:
@@ -87,7 +87,7 @@ jobs:
             exit 1
           fi
           if [[ ! "$SOURCE_TAG" =~ ^DEV-[a-zA-Z0-9._-]+$ ]]; then
-            echo "::error::The image_tag must be a valid DEV tag beginning with DEV-."
+            echo "::error::The image tag must begin with DEV-."
             exit 1
           fi
 
@@ -115,6 +115,10 @@ jobs:
           aws ecr describe-images \
             --repository-name "$SOURCE_REPOSITORY" \
             --image-ids imageTag="$SOURCE_TAG" \
+            --region "$AWS_REGION" >/dev/null
+
+          aws ecr describe-repositories \
+            --repository-names "$TARGET_REPOSITORY" \
             --region "$AWS_REGION" >/dev/null
 
           docker pull "${ECR_REGISTRY}/${SOURCE_REPOSITORY}:${SOURCE_TAG}"
@@ -147,6 +151,8 @@ jobs:
         (inputs.deploy_env != 'dev' && needs.promote-image.result == 'success')
       ) &&
       (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
+    environment:
+      name: ${{ inputs.deploy_env }}
     env:
       NAMESPACE: ${{ inputs.deploy_env }}
       IMAGE_TAG: ${{ inputs.deploy_env == 'dev' && needs.build-dev.outputs.image_tag || needs.promote-image.outputs.image_tag }}
@@ -162,11 +168,13 @@ jobs:
       - name: Verify Deployment Tools
         run: |
           command -v aws || { echo "::error::AWS CLI is unavailable."; exit 1; }
-          command -v kubectl || { echo "::error::kubectl is unavailable on this runner."; exit 1; }
-          command -v helm || { echo "::error::Helm is unavailable on this runner."; exit 1; }
+          command -v kubectl || { echo "::error::kubectl is unavailable."; exit 1; }
+          command -v helm || { echo "::error::Helm is unavailable."; exit 1; }
+          command -v docker || { echo "::error::Docker is unavailable."; exit 1; }
           aws --version
           kubectl version --client
           helm version
+          docker --version
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -209,30 +217,39 @@ jobs:
           kubectl create namespace "$NAMESPACE" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Check EBS Storage Class
+      - name: Configure StorageClass Management
         id: storage
         run: |
           if kubectl get storageclass ebs-gp3 >/dev/null 2>&1; then
-            echo "create_storage_class=false" >> "$GITHUB_OUTPUT"
+            echo "storage_class_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Existing ebs-gp3 StorageClass will be reused."
           else
-            echo "create_storage_class=true" >> "$GITHUB_OUTPUT"
+            echo "::error::StorageClass ebs-gp3 does not exist. Create it separately before deploying the database."
+            exit 1
           fi
 
-      - name: Deploy Database with Helm
-        env:
-          CREATE_STORAGE_CLASS: ${{ steps.storage.outputs.create_storage_class }}
+      - name: Validate Helm Files
         run: |
           if [[ ! -f "$VALUES_FILE" ]]; then
             echo "::error::Values file not found: $VALUES_FILE"
             exit 1
           fi
 
-          if ! helm upgrade --install "${HELM_RELEASE}" "${CHART}" \
+          if [[ ! -d "$HELM_CHART/templates" ]]; then
+            echo "::error::Helm templates directory not found in $HELM_CHART"
+            exit 1
+          fi
+
+      - name: Deploy Database with Helm
+        env:
+          STORAGE_CLASS_ENABLED: ${{ steps.storage.outputs.storage_class_enabled }}
+        run: |
+          if ! helm upgrade --install "${HELM_RELEASE}" "${HELM_CHART}" \
             --namespace "${NAMESPACE}" \
             --create-namespace \
             -f "${VALUES_FILE}" \
-            --set-string components.mysql.image="${REGISTRY}/${REPOSITORY}" \
-            --set-string components.mysql.tag="${TAG}" \
+            --set-string components.mysql.image="${ECR_REGISTRY}/${ECR_REPOSITORY}" \
+            --set-string components.mysql.tag="${IMAGE_TAG}" \
             --set components.mysql.enabled=true \
             --set components.mysql.service.enabled=true \
             --set components.frontend.enabled=false \
@@ -255,15 +272,12 @@ jobs:
 
       - name: Verify Database Deployment
         run: |
-          kubectl rollout status deployment \
-            -n "$NAMESPACE" \
-            --timeout=5m
-
+          helm status "$HELM_RELEASE" --namespace "$NAMESPACE"
           kubectl get pods,services,pvc -n "$NAMESPACE"
 
       - name: Clean Up Temporary Secret Files
         if: always()
         run: |
-          if [[ -n "${SECRET_DIR:-}" && -d "$SECRET_DIR" ]]; then
-            rm -rf "$SECRET_DIR"
+          if [[ -n "${SECRET_DIR:-}" && -d "${SECRET_DIR}" ]]; then
+            rm -rf "${SECRET_DIR}"
           fi
