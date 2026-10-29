@@ -1,4 +1,3 @@
-
 name: Employee Management Backend Pipeline
 
 on:
@@ -27,40 +26,31 @@ permissions:
 env:
   AWS_REGION: us-east-1
   AWS_ACCOUNT_ID: "020048087135"
+  EKS_CLUSTER: employee-mgm-dev-cluster
   ECR_REGISTRY: 020048087135.dkr.ecr.us-east-1.amazonaws.com
-  ECR_REPOSITORY_PREFIX: employee-mgm
-  ECR_REPOSITORY: employee-mgm-${{ inputs.deploy_env }}-backend
-  EKS_CLUSTER_NAME: employee-mgm-dev-cluster
   DEPLOY_ENV: ${{ inputs.deploy_env }}
   NAMESPACE: ${{ inputs.deploy_env }}
-  HELM_CHART_PATH: ./Helm
+  ECR_REPOSITORY: employee-mgm-${{ inputs.deploy_env }}-backend
   HELM_RELEASE: employee-management-backend
+  HELM_CHART: ./Helm
   VALUES_FILE: ./Helm/values-${{ inputs.deploy_env }}.yaml
   DOCKERFILE_PATH: ./backend/Dockerfile
   DOCKER_BUILD_CONTEXT: ./backend
 
 jobs:
   build-dev:
-    name: Build and Push DEV Backend
     if: ${{ inputs.deploy_env == 'dev' }}
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_tag: ${{ steps.image.outputs.image_tag }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Check AWS Role Secret
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-        shell: bash
+      - name: Verify Required Tools
         run: |
-          set -euo pipefail
-          if [[ -z "$AWS_ROLE_ARN" ]]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable."
-            exit 1
-          fi
-          echo "AWS role secret is available."
+          docker --version
+          aws --version
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -68,19 +58,24 @@ jobs:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
-
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push DEV Backend Image
-        id: build
+      - name: Generate DEV Image Tag
+        id: image
         shell: bash
         run: |
           set -euo pipefail
+          IMAGE_TAG="DEV-${GITHUB_SHA::7}"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Building backend image: $IMAGE_TAG"
 
-          TAG="DEV-${GITHUB_SHA::7}"
+      - name: Build and Push DEV Backend Image
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           if [[ ! -f "$DOCKERFILE_PATH" ]]; then
             echo "::error::Dockerfile not found: $DOCKERFILE_PATH"
@@ -93,35 +88,38 @@ jobs:
 
           docker build \
             -f "$DOCKERFILE_PATH" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             "$DOCKER_BUILD_CONTEXT"
 
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
           aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
-            --image-ids "imageTag=$TAG" \
+            --image-ids "imageTag=$IMAGE_TAG" \
             --region "$AWS_REGION" >/dev/null
 
-          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Successfully built and pushed $TAG"
+          echo "Successfully built and pushed $IMAGE_TAG"
 
   promote-image:
-    name: Promote Existing DEV Backend Image
     if: ${{ inputs.deploy_env != 'dev' }}
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.promote.outputs.image_tag }}
     steps:
-      - name: Validate Original DEV Image Tag
+      - name: Validate DEV Image Tag
         env:
           SOURCE_IMAGE_TAG: ${{ inputs.image_tag }}
         shell: bash
         run: |
           set -euo pipefail
 
+          if [[ -z "$SOURCE_IMAGE_TAG" ]]; then
+            echo "::error::Provide the original DEV image tag, for example DEV-b625074."
+            exit 1
+          fi
+
           if [[ ! "$SOURCE_IMAGE_TAG" =~ ^DEV-[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Provide a valid original DEV image tag, such as DEV-b625074."
+            echo "::error::Invalid DEV image tag: $SOURCE_IMAGE_TAG"
             exit 1
           fi
 
@@ -134,7 +132,7 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Promote Backend Image Between ECR Repositories
+      - name: Promote Existing DEV Backend Image
         id: promote
         env:
           SOURCE_IMAGE_TAG: ${{ inputs.image_tag }}
@@ -142,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SOURCE_REPOSITORY="${ECR_REPOSITORY_PREFIX}-dev-backend"
+          SOURCE_REPOSITORY="employee-mgm-dev-backend"
 
           aws ecr describe-repositories \
             --repository-names "$SOURCE_REPOSITORY" "$ECR_REPOSITORY" \
@@ -171,8 +169,7 @@ jobs:
           echo "image_tag=$TARGET_IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "Promoted $SOURCE_IMAGE_TAG to $TARGET_IMAGE_TAG"
 
-  deploy:
-    name: Deploy Backend to Kubernetes
+  deploy-backend:
     needs:
       - build-dev
       - promote-image
@@ -186,21 +183,15 @@ jobs:
     environment: ${{ inputs.deploy_env }}
     env:
       IMAGE_TAG: ${{ inputs.deploy_env == 'dev' && needs.build-dev.outputs.image_tag || needs.promote-image.outputs.image_tag }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Check AWS Role Secret
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-        shell: bash
+      - name: Verify Required Tools
         run: |
-          set -euo pipefail
-          if [[ -z "$AWS_ROLE_ARN" ]]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable."
-            exit 1
-          fi
-          echo "AWS role secret is available."
+          aws --version
+          docker --version
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -208,8 +199,8 @@ jobs:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Install kubectl and Helm
         shell: bash
@@ -233,13 +224,13 @@ jobs:
           set -euo pipefail
 
           aws eks update-kubeconfig \
-            --name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION"
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
 
-          kubectl get namespaces
+          kubectl cluster-info
           kubectl get nodes
 
-      - name: Create Selected Namespace
+      - name: Create Namespace
         shell: bash
         run: |
           set -euo pipefail
@@ -251,32 +242,10 @@ jobs:
 
           kubectl get namespace "$NAMESPACE"
 
-      - name: Validate Helm Chart and Values
+      - name: Validate Database Resources
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ ! -f "$VALUES_FILE" ]]; then
-            echo "::error::Helm values file not found: $VALUES_FILE"
-            exit 1
-          fi
-
-          if [[ ! -d "$HELM_CHART_PATH/templates" ]]; then
-            echo "::error::Helm templates directory not found: $HELM_CHART_PATH/templates"
-            exit 1
-          fi
-
-          helm lint "$HELM_CHART_PATH" -f "$VALUES_FILE"
-
-      - name: Deploy Backend with Helm
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "$IMAGE_TAG" ]]; then
-            echo "::error::Backend image tag is empty."
-            exit 1
-          fi
 
           if ! kubectl get configmap employee-cm -n "$NAMESPACE" >/dev/null 2>&1; then
             echo "::error::ConfigMap employee-cm does not exist in namespace $NAMESPACE. Deploy the DB pipeline first."
@@ -288,7 +257,36 @@ jobs:
             exit 1
           fi
 
-          if ! helm upgrade --install "$HELM_RELEASE" "$HELM_CHART_PATH" \
+          echo "Required database ConfigMap and Secret exist."
+
+      - name: Validate Helm Chart and Values
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$VALUES_FILE" ]]; then
+            echo "::error::Values file not found: $VALUES_FILE"
+            exit 1
+          fi
+
+          if [[ ! -d "$HELM_CHART/templates" ]]; then
+            echo "::error::Helm templates directory not found."
+            exit 1
+          fi
+
+          helm lint "$HELM_CHART" -f "$VALUES_FILE"
+
+      - name: Deploy Backend with Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$IMAGE_TAG" ]]; then
+            echo "::error::Backend image tag is empty."
+            exit 1
+          fi
+
+          if ! helm upgrade --install "$HELM_RELEASE" "$HELM_CHART" \
             --namespace "$NAMESPACE" \
             --create-namespace \
             -f "$VALUES_FILE" \
@@ -297,7 +295,9 @@ jobs:
             --set components.backend.enabled=true \
             --set components.backend.service.enabled=true \
             --set components.mysql.enabled=false \
+            --set components.mysql.service.enabled=false \
             --set components.frontend.enabled=false \
+            --set components.frontend.service.enabled=false \
             --set ingress.enabled=false \
             --set configMap.enabled=false \
             --set secret.enabled=false \
@@ -318,8 +318,11 @@ jobs:
           if ! kubectl rollout status deployment/backend \
             -n "$NAMESPACE" \
             --timeout=5m; then
-            echo "::error::Backend Deployment rollout failed in namespace $NAMESPACE."
-            kubectl logs deployment/backend -n "$NAMESPACE" --all-containers=true --tail=100 || true
+            echo "::error::Backend rollout failed in namespace $NAMESPACE."
+            kubectl logs deployment/backend \
+              -n "$NAMESPACE" \
+              --all-containers=true \
+              --tail=100 || true
             kubectl describe deployment/backend -n "$NAMESPACE" || true
             exit 1
           fi
