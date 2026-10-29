@@ -1,4 +1,3 @@
-
 name: Employee Management DB Pipeline
 
 on:
@@ -28,33 +27,27 @@ env:
   AWS_REGION: us-east-1
   AWS_ACCOUNT_ID: '020048087135'
   ECR_REGISTRY: 020048087135.dkr.ecr.us-east-1.amazonaws.com
-  ECR_REPOSITORY_PREFIX: employee-mgm
   EKS_CLUSTER_NAME: employee-mgm-dev-cluster
-  HELM_CHART_PATH: ./Helm
+  DEPLOY_ENV: ${{ inputs.deploy_env }}
   HELM_RELEASE: employee-management-db
+  HELM_CHART: ./Helm
+  VALUES_FILE: ./Helm/values-${{ inputs.deploy_env }}.yaml
 
 jobs:
   build-dev:
-    name: Build and Push DEV Database
+    name: Build and Push DB Image
     if: inputs.deploy_env == 'dev'
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_tag: ${{ steps.image.outputs.image_tag }}
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Check AWS Role Secret
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-        shell: bash
+      - name: Verify Docker
         run: |
-          set -euo pipefail
-          if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
-            exit 1
-          fi
-          echo "AWS role secret is available."
+          command -v docker
+          docker --version
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -62,72 +55,118 @@ jobs:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
-
-      - name: Build and Push Image
-        id: build
-        shell: bash
+      - name: Login to Amazon ECR
         run: |
-          set -euo pipefail
-
-          REPOSITORY="${ECR_REPOSITORY_PREFIX}-dev-db"
-          TAG="DEV-$(git rev-parse --short HEAD)"
-
-          test -f ./db/Dockerfile || {
-            echo "::error::./db/Dockerfile not found"
-            exit 1
-          }
-
-          aws ecr describe-repositories \
-            --repository-names "$REPOSITORY" \
-            --region "$AWS_REGION"
-
           aws ecr get-login-password --region "$AWS_REGION" |
             docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-          docker build \
-            -f ./db/Dockerfile \
-            -t "$ECR_REGISTRY/$REPOSITORY:$TAG" \
-            ./db
+      - name: Build and Push DEV Image
+        id: image
+        env:
+          ECR_REPOSITORY: employee-mgm-dev-db
+        run: |
+          IMAGE_TAG="DEV-${GITHUB_SHA::7}"
+          docker build -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" -f ./db/Dockerfile ./db
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Built and pushed ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-          docker push "$ECR_REGISTRY/$REPOSITORY:$TAG"
+  promote-image:
+    name: Promote Existing DB Image
+    if: inputs.deploy_env != 'dev'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.promote.outputs.image_tag }}
+    steps:
+      - name: Validate DEV Image Tag
+        env:
+          SOURCE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ -z "$SOURCE_TAG" ]]; then
+            echo "::error::Provide the original DEV image tag, for example DEV-b625074."
+            exit 1
+          fi
+          if [[ ! "$SOURCE_TAG" =~ ^DEV-[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::The image_tag must be a valid DEV tag beginning with DEV-."
+            exit 1
+          fi
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Promote DEV Image
+        id: promote
+        env:
+          SOURCE_TAG: ${{ inputs.image_tag }}
+        run: |
+          SOURCE_REPOSITORY="employee-mgm-dev-db"
+          TARGET_REPOSITORY="employee-mgm-${DEPLOY_ENV}-db"
+          TAG_SUFFIX="${SOURCE_TAG#DEV-}"
+          TARGET_TAG="${DEPLOY_ENV^^}-${TAG_SUFFIX}"
 
           aws ecr describe-images \
-            --repository-name "$REPOSITORY" \
-            --image-ids "imageTag=$TAG" \
-            --region "$AWS_REGION"
+            --repository-name "$SOURCE_REPOSITORY" \
+            --image-ids imageTag="$SOURCE_TAG" \
+            --region "$AWS_REGION" >/dev/null
 
-          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+          docker pull "${ECR_REGISTRY}/${SOURCE_REPOSITORY}:${SOURCE_TAG}"
+          docker tag "${ECR_REGISTRY}/${SOURCE_REPOSITORY}:${SOURCE_TAG}" "${ECR_REGISTRY}/${TARGET_REPOSITORY}:${TARGET_TAG}"
+          docker push "${ECR_REGISTRY}/${TARGET_REPOSITORY}:${TARGET_TAG}"
+
+          echo "image_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Promoted ${SOURCE_TAG} to ${TARGET_REPOSITORY}:${TARGET_TAG}"
 
   production-approval:
-    name: Manual Production Approval
+    name: Production Approval
     if: inputs.deploy_env == 'prod'
     runs-on: ubuntu-latest
-    environment:
-      name: prod
+    environment: prod
     steps:
-      - name: Production Approval Granted
-        run: echo "Production approval granted. The pipeline can continue."
+      - name: Approval Gate Passed
+        run: echo "Production approval received. The deployment can proceed."
 
-  promote:
-    name: Promote DEV Database Image
-    needs:
-      - production-approval
-    if: always() && inputs.deploy_env != 'dev' && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
+  deploy-db:
+    name: Deploy Database to EKS
     runs-on: ubuntu-latest
+    needs:
+      - build-dev
+      - promote-image
+      - production-approval
+    if: >-
+      !cancelled() &&
+      (
+        (inputs.deploy_env == 'dev' && needs.build-dev.result == 'success') ||
+        (inputs.deploy_env != 'dev' && needs.promote-image.result == 'success')
+      ) &&
+      (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
+    env:
+      NAMESPACE: ${{ inputs.deploy_env }}
+      IMAGE_TAG: ${{ inputs.deploy_env == 'dev' && needs.build-dev.outputs.image_tag || needs.promote-image.outputs.image_tag }}
+      ECR_REPOSITORY: employee-mgm-${{ inputs.deploy_env }}-db
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+      MYSQL_USER: ${{ secrets.MYSQL_USER }}
+      MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+      MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
     steps:
-      - name: Check AWS Role Secret
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-        shell: bash
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify Deployment Tools
         run: |
-          set -euo pipefail
-          if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
-            exit 1
-          fi
-          echo "AWS role secret is available."
+          command -v aws || { echo "::error::AWS CLI is unavailable."; exit 1; }
+          command -v kubectl || { echo "::error::kubectl is unavailable on this runner."; exit 1; }
+          command -v helm || { echo "::error::Helm is unavailable on this runner."; exit 1; }
+          aws --version
+          kubectl version --client
+          helm version
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -135,213 +174,86 @@ jobs:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
-
-      - name: Validate Original DEV Image Tag
-        shell: bash
-        env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+      - name: Login to Amazon ECR
         run: |
-          set -euo pipefail
-          if [[ ! "$IMAGE_TAG" =~ ^DEV-[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Provide a valid original DEV image tag, such as DEV-b625074."
-            exit 1
-          fi
-
-      - name: Promote Image Between ECR Repositories
-        shell: bash
-        env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
-          DEPLOY_ENV: ${{ inputs.deploy_env }}
-        run: |
-          set -euo pipefail
-
-          SOURCE_REPOSITORY="${ECR_REPOSITORY_PREFIX}-dev-db"
-          TARGET_REPOSITORY="${ECR_REPOSITORY_PREFIX}-${DEPLOY_ENV}-db"
-
-          aws ecr describe-repositories \
-            --repository-names "$SOURCE_REPOSITORY" "$TARGET_REPOSITORY" \
-            --region "$AWS_REGION"
-
           aws ecr get-login-password --region "$AWS_REGION" |
             docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-          docker pull "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG"
-
-          docker tag \
-            "$ECR_REGISTRY/$SOURCE_REPOSITORY:$IMAGE_TAG" \
-            "$ECR_REGISTRY/$TARGET_REPOSITORY:$IMAGE_TAG"
-
-          docker push "$ECR_REGISTRY/$TARGET_REPOSITORY:$IMAGE_TAG"
-
-          aws ecr describe-images \
-            --repository-name "$TARGET_REPOSITORY" \
-            --image-ids "imageTag=$IMAGE_TAG" \
-            --region "$AWS_REGION"
-
-  deploy:
-    name: Deploy Database to Kubernetes
-    needs:
-      - build-dev
-      - production-approval
-      - promote
-    if: always() && !cancelled() && (needs.build-dev.result == 'success' || needs.promote.result == 'success') && (inputs.deploy_env != 'prod' || needs.production-approval.result == 'success')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check AWS Role Secret
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::AWS_GITHUB_ACTIONS_ROLE_ARN secret is empty or unavailable"
-            exit 1
-          fi
-          echo "AWS role secret is available."
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
-
-      - name: Install kubectl and Helm
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          curl -fsSL -o kubectl \
-            "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-
-          chmod +x kubectl
-          sudo install kubectl /usr/local/bin/kubectl
-
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
-            bash
-
       - name: Configure EKS Access
-        shell: bash
         run: |
-          set -euo pipefail
-
           aws eks update-kubeconfig \
-            --name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION"
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl get nodes
 
-          kubectl get namespaces
-
-      - name: Create Selected Namespace
-        env:
-          DEPLOY_ENV: ${{ inputs.deploy_env }}
-        shell: bash
+      - name: Validate Database Secrets and Prepare Temporary Files
         run: |
-          set -euo pipefail
-
-          kubectl create namespace "$DEPLOY_ENV" \
-            --dry-run=client \
-            -o yaml |
-            kubectl apply -f -
-
-          kubectl get namespace "$DEPLOY_ENV"
-
-      - name: Deploy Database with Helm
-        shell: bash
-        env:
-          DEPLOY_ENV: ${{ inputs.deploy_env }}
-          DEV_IMAGE_TAG: ${{ needs.build-dev.outputs.image_tag }}
-          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
-          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
-          MYSQL_USER: ${{ secrets.MYSQL_USER }}
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
-          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
-        run: |
-          set -euo pipefail
-
-          if [ "$DEPLOY_ENV" = "dev" ]; then
-            TAG="$DEV_IMAGE_TAG"
-          else
-            TAG="$INPUT_IMAGE_TAG"
-          fi
-
-          if [ -z "$TAG" ]; then
-            echo "::error::Database image tag is empty."
-            exit 1
-          fi
-
-          NAMESPACE="$DEPLOY_ENV"
-          CHART="$HELM_CHART_PATH"
-          REPOSITORY="${ECR_REPOSITORY_PREFIX}-${DEPLOY_ENV}-db"
-          REGISTRY="$ECR_REGISTRY"
-          VALUES_FILE="${CHART}/values-${DEPLOY_ENV}.yaml"
-
-          test -f "$VALUES_FILE" || {
-            echo "::error::Helm values file not found: $VALUES_FILE"
-            exit 1
-          }
-
-          SECRET_DIR="$(mktemp -d)"
-          chmod 700 "$SECRET_DIR"
-          trap 'rm -rf "$SECRET_DIR"' EXIT
-
           for SECRET_NAME in MYSQL_ROOT_PASSWORD MYSQL_USER MYSQL_PASSWORD MYSQL_DATABASE; do
-            SECRET_VALUE="${!SECRET_NAME:-}"
-
-            if [ -z "$SECRET_VALUE" ]; then
+            if [[ -z "${!SECRET_NAME:-}" ]]; then
               echo "::error::Required GitHub Actions secret $SECRET_NAME is empty or unavailable."
               exit 1
             fi
+          done
 
-            printf '%s' "$SECRET_VALUE" > "${SECRET_DIR}/${SECRET_NAME}"
+          SECRET_DIR="$(mktemp -d)"
+          chmod 700 "$SECRET_DIR"
+          echo "SECRET_DIR=$SECRET_DIR" >> "$GITHUB_ENV"
+
+          for SECRET_NAME in MYSQL_ROOT_PASSWORD MYSQL_USER MYSQL_PASSWORD MYSQL_DATABASE; do
+            printf '%s' "${!SECRET_NAME}" > "${SECRET_DIR}/${SECRET_NAME}"
             chmod 600 "${SECRET_DIR}/${SECRET_NAME}"
           done
 
+      - name: Create Target Namespace
+        run: |
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Check EBS Storage Class
+        id: storage
+        run: |
           if kubectl get storageclass ebs-gp3 >/dev/null 2>&1; then
-            STORAGE_CLASS_ENABLED="false"
+            echo "create_storage_class=false" >> "$GITHUB_OUTPUT"
           else
-            STORAGE_CLASS_ENABLED="true"
+            echo "create_storage_class=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if ! helm upgrade --install "${HELM_RELEASE}" "${CHART}" \
-            --namespace "${NAMESPACE}" \
+      - name: Deploy Database with Helm
+        env:
+          CREATE_STORAGE_CLASS: ${{ steps.storage.outputs.create_storage_class }}
+        run: |
+          if [[ ! -f "$VALUES_FILE" ]]; then
+            echo "::error::Values file not found: $VALUES_FILE"
+            exit 1
+          fi
+
+          helm upgrade --install "$HELM_RELEASE" "$HELM_CHART" \
+            --namespace "$NAMESPACE" \
             --create-namespace \
-            -f "${VALUES_FILE}" \
-            --set-string components.mysql.image="${REGISTRY}/${REPOSITORY}" \
-            --set-string components.mysql.tag="${TAG}" \
+            -f "$VALUES_FILE" \
+            --set-string components.mysql.image="${ECR_REGISTRY}/${ECR_REPOSITORY}" \
+            --set-string components.mysql.tag="$IMAGE_TAG" \
             --set components.mysql.enabled=true \
             --set components.mysql.service.enabled=true \
-            --set components.frontend.enabled=false \
-            --set components.backend.enabled=false \
-            --set ingress.enabled=false \
-            --set configMap.enabled=true \
-            --set secret.enabled=true \
-            --set storageClass.enabled="${STORAGE_CLASS_ENABLED}" \
+            --set components.mysql.storageClass.create="$CREATE_STORAGE_CLASS" \
             --set-file secret.stringData.MYSQL_ROOT_PASSWORD="${SECRET_DIR}/MYSQL_ROOT_PASSWORD" \
             --set-file secret.stringData.MYSQL_USER="${SECRET_DIR}/MYSQL_USER" \
             --set-file secret.stringData.MYSQL_PASSWORD="${SECRET_DIR}/MYSQL_PASSWORD" \
             --set-file secret.stringData.MYSQL_DATABASE="${SECRET_DIR}/MYSQL_DATABASE" \
             --wait \
-            --timeout 10m; then
-            echo "::error::Helm database deployment failed in namespace ${NAMESPACE}."
-            helm status "${HELM_RELEASE}" -n "${NAMESPACE}" || true
-            kubectl get pods,services,pvc -n "${NAMESPACE}" || true
-            exit 1
-          fi
+            --timeout 10m
 
-          if ! kubectl rollout status deployment/mysql \
-            -n "${NAMESPACE}" \
-            --timeout=5m; then
-            echo "::error::MySQL Deployment rollout failed in namespace ${NAMESPACE}."
-            kubectl logs deployment/mysql -n "${NAMESPACE}" --all-containers=true --tail=100 || true
-            kubectl describe deployment/mysql -n "${NAMESPACE}" || true
-            exit 1
-          fi
+      - name: Verify Database Deployment
+        run: |
+          kubectl rollout status deployment \
+            -n "$NAMESPACE" \
+            --timeout=5m
 
-          kubectl get pods,services,pvc -n "${NAMESPACE}"
+          kubectl get pods,services,pvc -n "$NAMESPACE"
+
+      - name: Clean Up Temporary Secret Files
+        if: always()
+        run: |
+          if [[ -n "${SECRET_DIR:-}" && -d "$SECRET_DIR" ]]; then
+            rm -rf "$SECRET_DIR"
+          fi
